@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-door"
+version = "0.1.0"
+description = "A humanoid project for door opening"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  {name = "Your Name", email = "your.email@example.com"}
+]
+
+[project.entry-points."active_adaptation.projects"]
+open_door = "open_door"
+
+[project.entry-points."active_adaptation.learning"]
+open_door_learning = "open_door_learning"
