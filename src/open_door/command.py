@@ -37,6 +37,9 @@ class OpenDoor(Command):
     def __init__(
         self,
         env,
+        x_range=(-5.0, 5.0),
+        y_range=(-5.0, 5.0),
+        angle_range=(0, 2 * math.pi),
         linvel_x_range=(-1.0, 1.0),
         linvel_y_range=(-1.0, 1.0),
         angvel_range=(-1, 1),
@@ -48,8 +51,17 @@ class OpenDoor(Command):
         stand_prob=0.2,
         target_yaw_range=(0, torch.pi * 2),
         curriculum: bool = False,
+        # Target position parameters
+        use_target_pos_ratio: float = 0.0,
+        pos_p_gain: float = 1.0,
+        heading_p_gain: float = 1.0,
+        target_distance_range=(1.0, 5.0),
+        reach_threshold: float = 0.5,
     ):
         super().__init__(env)
+        self.x_range = x_range
+        self.y_range = y_range
+        self.angle_range = angle_range
         self.linvel_x_range = linvel_x_range
         self.linvel_y_range = linvel_y_range
         self.angvel_range = angvel_range
@@ -60,6 +72,12 @@ class OpenDoor(Command):
         self.resample_prob = resample_prob
         self.stand_prob = stand_prob
         self.curriculum = curriculum and self.env.backend == "isaac"
+        # Target position params
+        self.use_target_pos_ratio = use_target_pos_ratio
+        self.pos_p_gain = pos_p_gain
+        self.heading_p_gain = heading_p_gain
+        self.target_distance_range = target_distance_range
+        self.reach_threshold = reach_threshold
 
         if self.curriculum:
             self.terrain = self.env.scene.terrain
@@ -88,6 +106,13 @@ class OpenDoor(Command):
 
             self.distance_commanded = torch.zeros(self.num_envs, 1)
             self.distance_traveled = torch.zeros(self.num_envs, 1)
+
+            # Target position buffers
+            self.target_pos_w = torch.zeros(self.num_envs, 2)
+            self.is_target_pos_env = torch.zeros(self.num_envs, 1, dtype=bool)
+            self.pos_error_b = torch.zeros(self.num_envs, 2)
+            self.heading_error = torch.zeros(self.num_envs, 1)
+            self.target_distance = torch.zeros(self.num_envs, 1)
 
             self._cum_error = torch.zeros(self.num_envs, 2)
             self._cum_linvel_error = self._cum_error[:, 0].unsqueeze(1)
@@ -135,6 +160,16 @@ class OpenDoor(Command):
         self._cum_linvel_error[env_ids] = 0.0
         self._cum_angvel_error[env_ids] = 0.0
         self.is_standing_env[env_ids] = True
+
+        # Decide which envs use target position mode
+        self.is_target_pos_env[env_ids] = (
+            torch.rand(len(env_ids), 1, device=self.device) < self.use_target_pos_ratio
+        )
+        # Initialize target position to current position (will be resampled in first update)
+        self.target_pos_w[env_ids] = self.asset.data.root_link_pos_w[env_ids, :2]
+        self.target_distance[env_ids] = 0.0
+        self.pos_error_b[env_ids] = 0.0
+        self.heading_error[env_ids] = 0.0
     
     @override
     def sample_init(self, env_ids):
@@ -171,6 +206,18 @@ class OpenDoor(Command):
 
         max_command_speed = (2.5 - self.cmd_yawvel_b.abs()).clamp(0.0)
         self.cmd_linvel_b.lerp_(self.next_command_linvel, 0.1)
+
+        # Position target mode: P-control override
+        current_pos_w = self.asset.data.root_link_pos_w[:, :2]
+        pos_error_w = self.target_pos_w - current_pos_w  # (N, 2)
+        pos_error_w_3d = F.pad(pos_error_w, (0, 1))  # (N, 3) pad z=0
+        pos_error_b_3d = quat_rotate_inverse(yaw_quat(self.quat_w), pos_error_w_3d)
+        self.pos_error_b = pos_error_b_3d[:, :2]
+        self.target_distance = pos_error_w.norm(dim=-1, keepdim=True)
+        desired_vel_b = self.pos_p_gain * pos_error_b_3d
+        is_pos_3d = self.is_target_pos_env.expand_as(self.cmd_linvel_b)
+        self.cmd_linvel_b = torch.where(is_pos_3d, desired_vel_b, self.cmd_linvel_b)
+
         self.cmd_linvel_b = clamp_norm(self.cmd_linvel_b, max=max_command_speed)
         self.command_speed = self.cmd_linvel_b.norm(dim=-1, keepdim=True)
     
@@ -179,7 +226,9 @@ class OpenDoor(Command):
         self.distance_traveled = self.distance_traveled + self.current_speed * self.env.step_dt
 
         interval_reached = (self.env.episode_length_buf - 20) % self.resample_interval == 0
-        resample_vel = interval_reached & (
+        is_vel_mode = ~self.is_target_pos_env.squeeze(1)
+        # Velocity mode: resample velocity commands on interval
+        resample_vel = interval_reached & is_vel_mode & (
             self.with_prob(self.num_envs, self.resample_prob)
             | self.is_standing_env.squeeze(1)
         )
@@ -190,17 +239,38 @@ class OpenDoor(Command):
         self.sample_vel_command(resample_vel.nonzero().squeeze(-1))
         self.sample_yaw_command(resample_yaw.nonzero().squeeze(-1))
 
+        # Position mode: resample when target reached or on interval
+        is_pos_mode = self.is_target_pos_env.squeeze(1)
+        pos_reached = is_pos_mode & (self.target_distance.squeeze(-1) < self.reach_threshold)
+        pos_resample = pos_reached | (
+            interval_reached & is_pos_mode
+            & self.with_prob(self.num_envs, self.resample_prob)
+        )
+        if pos_resample.any():
+            self.sample_pos_command(pos_resample.nonzero().squeeze(-1))
+
         yaw_diff = wrap_to_pi(self.target_yaw - self.body_heading_w).reshape(self.num_envs, 1)
-        cmd_yawvel_b = torch.clamp(
+        self.heading_error = yaw_diff
+
+        # Velocity mode yaw: stiffness P-control or fixed speed
+        vel_yawvel = torch.clamp(
             self.yaw_stiffness * yaw_diff,
+            min=self.angvel_range[0],
+            max=self.angvel_range[1],
+        ).reshape(self.num_envs, 1)
+        vel_yawvel = torch.where(
+            self.use_stiffness, vel_yawvel, self.fixed_yaw_speed
+        ).reshape(self.num_envs, 1)
+
+        # Position mode yaw: always use heading P-control
+        pos_yawvel = torch.clamp(
+            self.heading_p_gain * yaw_diff,
             min=self.angvel_range[0],
             max=self.angvel_range[1],
         ).reshape(self.num_envs, 1)
 
         self.cmd_yawvel_b = torch.where(
-            self.use_stiffness,
-            cmd_yawvel_b,
-            self.fixed_yaw_speed
+            self.is_target_pos_env, pos_yawvel, vel_yawvel
         ).reshape(self.num_envs, 1)
 
         self.cmd_linvel_w = quat_rotate(yaw_quat(self.quat_w), self.cmd_linvel_b)
@@ -224,9 +294,38 @@ class OpenDoor(Command):
         self.use_stiffness[env_ids] = self.with_prob(shape, self.use_stiffness_ratio)
         self.fixed_yaw_speed[env_ids] = sample_uniform(shape, *self.angvel_range, self.device)
 
+    def sample_pos_command(self, env_ids: torch.Tensor):
+        """Sample random target positions relative to the robot's current position."""
+        if len(env_ids) == 0:
+            return
+        n = len(env_ids)
+        # Random direction and distance
+        angle = torch.rand(n, 1, device=self.device) * 2 * math.pi
+        distance = sample_uniform((n, 1), *self.target_distance_range, self.device)
+        current_pos = self.asset.data.root_link_pos_w[env_ids, :2]
+        offset = torch.cat([distance * angle.cos(), distance * angle.sin()], dim=-1)
+        self.target_pos_w[env_ids] = current_pos + offset
+        # Also resample base height
+        self.cmd_base_height[env_ids] = sample_uniform(
+            (n, 1), *self.base_height_range, self.device
+        )
+
     def with_prob(self, n, p):
         return torch.rand(n, device=self.device) < p
     
+    @property
+    def command_target(self):
+        """Target position error (body frame) + heading error. Optional observation."""
+        return torch.cat([
+            self.pos_error_b,
+            self.heading_error.reshape(self.num_envs, 1),
+        ], dim=-1)
+
+    @property
+    def command_mode(self):
+        """1.0 for position target mode, 0.0 for velocity command mode."""
+        return self.is_target_pos_env.float()
+
     @override
     def debug_draw(self):
         start = self.asset.data.root_link_pos_w + torch.tensor([0.0, 0.0, 0.2], device=self.device)
@@ -249,6 +348,15 @@ class OpenDoor(Command):
                 yaw_vec,
                 color=(0.2, 0.2, 1.0, 1.0),
             )
+            # Draw target position for position-mode envs
+            is_pos = self.is_target_pos_env.squeeze(-1)
+            if is_pos.any():
+                target_3d = F.pad(self.target_pos_w, (0, 1), value=0.2)  # z=0.2
+                pos_ids = is_pos.nonzero().squeeze(-1)
+                self.env.debug_draw.point(
+                    target_3d[pos_ids],
+                    color=(0.0, 1.0, 0.0, 1.0),
+                )
         elif self.env.backend == "mjlab":
             rpy = torch.zeros(self.num_envs, 3)
             rpy[:, 2] = self.target_yaw.cpu()

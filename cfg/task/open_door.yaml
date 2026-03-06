@@ -11,7 +11,7 @@ robot:
 terrain: plane
 
 # common
-num_envs: 4096
+num_envs: 20
 max_episode_length: 1000
 
 sim:
@@ -48,11 +48,17 @@ command:
   use_stiffness_ratio: 0.9
   stand_prob: 0.05
   curriculum: false
+  # Target position mode (P-control -> velocity)
+  use_target_pos_ratio: 1.0
+  pos_p_gain: 1.0
+  heading_p_gain: 1.0
+  target_distance_range: [1.0, 5.0]
+  reach_threshold: 0.5
 
 observation:
   # command:
   policy:
-    command: {}
+    command_target: {}
     gravity_multistep: {steps: 4, noise_std: 0.05}
     joint_pos_multistep: {joint_names: "(?!(.*wrist.*)).*", steps: 4, noise_std: 0.05}
     joint_vel_multistep: {joint_names: "(?!(.*wrist.*)).*", steps: 4, noise_std: 0.2}
