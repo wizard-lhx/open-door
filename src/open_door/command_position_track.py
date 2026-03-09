@@ -32,7 +32,7 @@ def quat_to_yaw(quat: torch.Tensor):
     return yaw % (2 * torch.pi)
 
 
-class OpenDoor(Command):
+class PositionTracking(Command):
 
     def __init__(
         self,

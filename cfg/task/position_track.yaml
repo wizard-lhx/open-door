@@ -1,5 +1,5 @@
 # @package task
-name: G1LocoFlat
+name: G1PositionTrack
 
 viewer:
   resolution: [1280, 720]
@@ -40,7 +40,7 @@ input:
     alpha_range: [0.8, 1.0]
 
 command:
-  _target_: OpenDoor
+  _target_: PositionTracking
   linvel_x_range: [-0.8, 1.4]
   linvel_y_range: [-0.8, 0.8]
   angvel_range: [-2.0, 2.0]
