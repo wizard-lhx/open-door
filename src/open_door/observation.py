@@ -22,3 +22,19 @@ class command_target(Observation):
         return symmetry_utils.SymmetryTransform(
             perm=torch.arange(3), signs=[1, -1, -1]
         )
+
+
+class command_hand_target(Observation):
+    """Hand end-effector position errors in body frame: [left_xyz, right_xyz] (6-dim)."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        self.command_manager = self.env.command_manager
+
+    @override
+    def compute(self):
+        return self.command_manager.command_hand_target
+
+    @override
+    def symmetry_transform(self):
+        return self.command_manager.hand_target_symmetry_transform()
