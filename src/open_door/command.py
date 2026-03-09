@@ -37,9 +37,6 @@ class OpenDoor(Command):
     def __init__(
         self,
         env,
-        x_range=(-5.0, 5.0),
-        y_range=(-5.0, 5.0),
-        angle_range=(0, 2 * math.pi),
         linvel_x_range=(-1.0, 1.0),
         linvel_y_range=(-1.0, 1.0),
         angvel_range=(-1, 1),
@@ -59,9 +56,6 @@ class OpenDoor(Command):
         reach_threshold: float = 0.5,
     ):
         super().__init__(env)
-        self.x_range = x_range
-        self.y_range = y_range
-        self.angle_range = angle_range
         self.linvel_x_range = linvel_x_range
         self.linvel_y_range = linvel_y_range
         self.angvel_range = angvel_range

@@ -11,7 +11,7 @@ robot:
 terrain: plane
 
 # common
-num_envs: 20
+num_envs: 4096
 max_episode_length: 1000
 
 sim:
