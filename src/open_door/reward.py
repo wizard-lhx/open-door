@@ -20,21 +20,12 @@ class hand_tracking_exp(Reward):
     def compute(self) -> torch.Tensor:
         # hand_pos_error_b: (N, 2, 3)
         error = self.command_manager.hand_pos_error_b
-        error_dist = error.norm(dim=-1)  # (N, 2) L2 distance per hand
-        error_sq = error_dist.square()   # (N, 2)
+        error_sq = error.square().sum(dim=-1)   # (N, 2)
         rew = torch.exp(-error_sq / self.sigma).mean(dim=-1, keepdim=True)  # (N, 1)
 
         # Log error statistics for tuning sigma
-        error_flat = error_dist.detach().cpu().reshape(-1)
+        error_flat = error_sq.detach().cpu().reshape(-1)
         self.env.extra["hand_track/error_mean"] = error_flat.mean()
-        self.env.extra["hand_track/error_std"] = error_flat.std()
-        self.env.extra["hand_track/error_max"] = error_flat.max()
-        self.env.extra["hand_track/error_left"] = error_dist[:, 0].mean()
-        self.env.extra["hand_track/error_right"] = error_dist[:, 1].mean()
-        self.env.extra["hand_track/reward_mean"] = rew.mean()
-
-        # Log error distribution histogram to wandb
-        self.env.extra["hand_track/error_sq_dist"] = wandb.Histogram(error_sq.detach().cpu().reshape(-1).numpy())
 
         return rew
 
