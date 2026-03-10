@@ -92,6 +92,11 @@ python active-adaptation/scripts/play.py \
   task=open_door \
   algo=ppo_symaug \
   checkpoint_path=outputs/2026-03-06/23-28-44-G1LocoFlat-ppo_symaug/wandb/run-20260306_232932-1lr1am7e/files/checkpoint_final.pt
+or
+python active-adaptation/scripts/play.py \
+  task=keypoint_track \
+  algo=ppo_symaug \
+  checkpoint_path=run:wizardhxliang-southern-university-of-science-technology/active_adaptation/9fg69xru
 ```
 
 ## Configuration
