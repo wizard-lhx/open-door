@@ -93,7 +93,7 @@ reward:
     feet_sliding:       {weight: 0.2, body_names: .*ankle_roll_link}
     foot_clearance:     {weight: 1.0, body_names: .*ankle_roll_link, target_height: 0.1, std: 0.05, tanh_mult: 2.0}
     joint_vel_l2:       {weight: 1.0e-3, joint_names: [.*shoulder.*]}
-    joint_deviation_l2: {weight: 0.1, joint_names: [.*shoulder.*, .*hip.*, .*elbow_joint]}
+    # joint_deviation_l2: {weight: 0.1, joint_names: [.*shoulder.*, .*hip.*, .*elbow_joint]}
   debug:
     _enabled_: false
     feet_contact_count: {weight: 1.0, body_names: .*ankle_roll_link}
