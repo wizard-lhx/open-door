@@ -123,3 +123,41 @@ class feet_gait(Reward):
 
         active = ~self.command_manager.is_standing_env
         return reward.reshape(self.num_envs, 1), active.reshape(self.num_envs, 1)
+
+
+class pos_tracking_exp(Reward):
+    """Exponential reward for root position tracking (body frame error).
+
+    reward = exp(-||pos_error_b||^2 / sigma)
+    """
+
+    def __init__(self, env, weight: float, sigma: float = 0.5):
+        super().__init__(env, weight)
+        self.sigma = sigma
+
+    @override
+    def compute(self) -> torch.Tensor:
+        pos_error = self.command_manager.pos_error_b  # (N, 2)
+        error_sq = pos_error.square().sum(dim=-1, keepdim=True)  # (N, 1)
+        rew = torch.exp(-error_sq / self.sigma)
+        self.env.extra["pos_track/error_sq_dist"] = error_sq.detach().cpu().reshape(-1).numpy()
+        return rew
+
+
+class heading_tracking_exp(Reward):
+    """Exponential reward for heading tracking.
+
+    reward = exp(-heading_error^2 / sigma)
+    """
+
+    def __init__(self, env, weight: float, sigma: float = 0.25):
+        super().__init__(env, weight)
+        self.sigma = sigma
+
+    @override
+    def compute(self) -> torch.Tensor:
+        heading_error = self.command_manager.heading_error  # (N, 1)
+        error_sq = heading_error.square()
+        rew = torch.exp(-error_sq / self.sigma)
+        self.env.extra["heading_track/error_sq_dist"] = error_sq.detach().cpu().reshape(-1).numpy()
+        return rew

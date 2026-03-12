@@ -37,34 +37,41 @@ class KpPosTrack(Command):
     def __init__(
         self,
         env,
-        linvel_x_range=(-1.0, 1.0),
-        linvel_y_range=(-1.0, 1.0),
-        angvel_range=(-1, 1),
-        yaw_stiffness_range=(0.5, 0.6),
-        use_stiffness_ratio: float = 0.5,
-        base_height_range=(0.2, 0.4),
+        # Position command parameters (body frame offsets for target sampling)
+        pos_x_range=(-3.0, 3.0),
+        pos_y_range=(-2.0, 2.0),
+        pos_kp: float = 1.0,
+        max_linvel_x: float = 1.0,
+        max_linvel_y: float = 0.6,
+        arrival_thresh: float = 0.2,
+        # Heading parameters
+        angvel_range=(-1.0, 1.0),
+        yaw_stiffness_range=(0.5, 1.0),
+        target_yaw_range=(0, torch.pi * 2),
+        # Common
         resample_interval: int = 300,
         resample_prob: float = 0.75,
         stand_prob=0.2,
-        target_yaw_range=(0, torch.pi * 2),
         curriculum: bool = False,
         teleop: bool = False,
         # Hand end-effector target parameters
         hand_body_names: Tuple[str, str] = ("left_wrist_yaw_link", "right_wrist_yaw_link"),
         hand_target_range_b: Tuple[Tuple[float, ...], Tuple[float, ...]] = (
-            (-0.1, -0.3, -0.2),  # min (x, y, z) relative to torso in body frame
-            (0.5, 0.3, 0.5),     # max (x, y, z) relative to torso in body frame
+            (-0.1, -0.3, -0.2),
+            (0.5, 0.3, 0.5),
         ),
         hand_resample_interval: int = 200,
-        hand_max_step_size: float = 0.005,  # max distance per step (m), controls trajectory speed
+        hand_max_step_size: float = 0.005,
     ):
         super().__init__(env, teleop)
-        self.linvel_x_range = linvel_x_range
-        self.linvel_y_range = linvel_y_range
+        self.pos_x_range = pos_x_range
+        self.pos_y_range = pos_y_range
+        self.pos_kp = pos_kp
+        self.max_linvel_x = max_linvel_x
+        self.max_linvel_y = max_linvel_y
+        self.arrival_thresh = arrival_thresh
         self.angvel_range = angvel_range
-        self.use_stiffness_ratio = use_stiffness_ratio
         self.yaw_stiffness_range = yaw_stiffness_range
-        self.base_height_range = base_height_range
         self.resample_interval = resample_interval
         self.resample_prob = resample_prob
         self.stand_prob = stand_prob
@@ -97,18 +104,19 @@ class KpPosTrack(Command):
 
             self.target_yaw = torch.zeros(self.num_envs, 1)
             self.yaw_stiffness = torch.zeros(self.num_envs, 1)
-            self.use_stiffness = torch.zeros(self.num_envs, 1, dtype=bool)
-            self.fixed_yaw_speed = torch.zeros(self.num_envs, 1)
 
             self.is_standing_env = torch.zeros(self.num_envs, 1, dtype=bool)
 
+            # Position command buffers
+            self.target_pos_w = torch.zeros(self.num_envs, 2)  # target xy in world frame
+            self.pos_error_b = torch.zeros(self.num_envs, 2)   # position error in body frame
+            self.heading_error = torch.zeros(self.num_envs, 1)  # heading error
+
+            # Velocity (computed via P-control from position error)
             self.command_speed = torch.zeros(self.num_envs, 1)
-            self.next_command_linvel = torch.zeros(self.num_envs, 3)
             self.cmd_linvel_b = torch.zeros(self.num_envs, 3)
             self.cmd_linvel_w = torch.zeros(self.num_envs, 3)
             self.cmd_yawvel_b = torch.zeros(self.num_envs, 1)
-            self.cmd_base_height = torch.zeros(self.num_envs, 1)
-
             self.distance_commanded = torch.zeros(self.num_envs, 1)
             self.distance_traveled = torch.zeros(self.num_envs, 1)
 
@@ -130,16 +138,16 @@ class KpPosTrack(Command):
         if self.teleop and self.env.backend == "isaac":
             self.key_mappings_pos = {
                 "W": torch.tensor(
-                    [self.linvel_x_range[1], 0.0, 0.0], device=self.device
+                    [self.max_linvel_x, 0.0, 0.0], device=self.device
                 ),
                 "S": torch.tensor(
-                    [self.linvel_x_range[0], 0.0, 0.0], device=self.device
+                    [-self.max_linvel_x, 0.0, 0.0], device=self.device
                 ),
                 "A": torch.tensor(
-                    [0.0, self.linvel_y_range[1], 0.0], device=self.device
+                    [0.0, self.max_linvel_y, 0.0], device=self.device
                 ),
                 "D": torch.tensor(
-                    [0.0, self.linvel_y_range[0], 0.0], device=self.device
+                    [0.0, -self.max_linvel_y, 0.0], device=self.device
                 ),
             }
             # use left-right arrow keys to rotate
@@ -170,7 +178,6 @@ class KpPosTrack(Command):
         return torch.cat([
             self.cmd_linvel_b[:, :2],
             self.cmd_yawvel_b.reshape(self.num_envs, 1),
-            self.cmd_base_height.reshape(self.num_envs, 1),
         ], dim=-1)
 
     @override
@@ -192,9 +199,13 @@ class KpPosTrack(Command):
 
     @override
     def reset(self, env_ids):
-        self.next_command_linvel[env_ids] = 0.0
-        self.cmd_linvel_b[env_ids] = 0.0
+        # Initialize position target to current position (error = 0)
+        root_pos_w = self.asset.data.root_link_pos_w[env_ids]
+        self.target_pos_w[env_ids] = root_pos_w[:, :2]
         self.target_yaw[env_ids] = self.asset.data.heading_w[env_ids, None]
+        self.pos_error_b[env_ids] = 0.0
+        self.heading_error[env_ids] = 0.0
+        self.cmd_linvel_b[env_ids] = 0.0
         self.cmd_yawvel_b[env_ids] = 0.0
 
         self._cum_linvel_error[env_ids] = 0.0
@@ -238,63 +249,68 @@ class KpPosTrack(Command):
         max_speed = max(0.0, 2.5 - self._teleop_yaw.abs().item())
         self.cmd_linvel_b = clamp_norm(linvel, max=max_speed)
         self.cmd_yawvel_b[:] = (self._teleop_yaw * scale).clamp(*self.angvel_range)
-        self.cmd_base_height[:] = sum(self.base_height_range) / 2
 
         self.quat_w = self.asset.data.root_link_quat_w
         self.cmd_linvel_w = quat_rotate(yaw_quat(self.quat_w), self.cmd_linvel_b)
         self.command_speed = self.cmd_linvel_b.norm(dim=-1, keepdim=True)
         self.is_standing_env = (self.command_speed < 0.1) & (self.cmd_yawvel_b.abs() < 0.1)
 
+        # Keep pos_error_b / heading_error zeroed in teleop (no position target)
+        self.pos_error_b[:] = 0.0
+        self.heading_error[:] = 0.0
+
     def _update_training(self):
         self.body_heading_w = self.asset.data.heading_w.unsqueeze(1)
         self.lin_vel_w = self.asset.data.root_com_lin_vel_w
         self.ang_vel_w = self.asset.data.root_com_ang_vel_w
         self.quat_w = self.asset.data.root_link_quat_w
+        root_pos_w = self.asset.data.root_link_pos_w
+        yaw_q = yaw_quat(self.quat_w)
 
-        # this is used for terminating episodes where the robot is inactive due to whatever reason
-        linvel_diff = self.lin_vel_w[:, :2] - self.cmd_linvel_w[:, :2]
-        linvel_error = linvel_diff.norm(dim=-1, keepdim=True)
-        angvel_diff = self.cmd_yawvel_b - self.ang_vel_w[:, 2:3]
-        angvel_error = angvel_diff.abs()
+        # --- Position P-control → velocity command ---
+        pos_error_w = torch.zeros(self.num_envs, 3, device=self.device)
+        pos_error_w[:, :2] = self.target_pos_w - root_pos_w[:, :2]
+        self.pos_error_b = quat_rotate_inverse(yaw_q, pos_error_w)[:, :2]  # (N, 2)
 
-        self._cum_linvel_error.mul_(0.98).add_(linvel_error * self.env.step_dt)
-        self._cum_angvel_error.mul_(0.98).add_(angvel_error * self.env.step_dt)
-
-        max_command_speed = (2.5 - self.cmd_yawvel_b.abs()).clamp(0.0)
-        self.cmd_linvel_b.lerp_(self.next_command_linvel, 0.1)
-        self.cmd_linvel_b = clamp_norm(self.cmd_linvel_b, max=max_command_speed)
+        self.cmd_linvel_b[:, 0] = (self.pos_kp * self.pos_error_b[:, 0]).clamp(-self.max_linvel_x, self.max_linvel_x)
+        self.cmd_linvel_b[:, 1] = (self.pos_kp * self.pos_error_b[:, 1]).clamp(-self.max_linvel_y, self.max_linvel_y)
+        self.cmd_linvel_b[:, 2] = 0.0
         self.command_speed = self.cmd_linvel_b.norm(dim=-1, keepdim=True)
-    
-        self.current_speed = self.lin_vel_w.norm(dim=-1, keepdim=True)
-        self.distance_commanded = self.distance_commanded + self.command_speed * self.env.step_dt
-        self.distance_traveled = self.distance_traveled + self.current_speed * self.env.step_dt
 
-        interval_reached = (self.env.episode_length_buf - 20) % self.resample_interval == 0
-        resample_vel = interval_reached & (
-            self.with_prob(self.num_envs, self.resample_prob)
-            | self.is_standing_env.squeeze(1)
-        )
-        resample_yaw = interval_reached & (
-            self.with_prob(self.num_envs, self.resample_prob)
-            | self.is_standing_env.squeeze(1)
-        )
-        self.sample_vel_command(resample_vel.nonzero().squeeze(-1))
-        self.sample_yaw_command(resample_yaw.nonzero().squeeze(-1))
-
-        yaw_diff = wrap_to_pi(self.target_yaw - self.body_heading_w).reshape(self.num_envs, 1)
-        cmd_yawvel_b = torch.clamp(
-            self.yaw_stiffness * yaw_diff,
+        # --- Heading P-control → yaw velocity ---
+        self.heading_error = wrap_to_pi(self.target_yaw - self.body_heading_w).reshape(self.num_envs, 1)
+        self.cmd_yawvel_b = torch.clamp(
+            self.yaw_stiffness * self.heading_error,
             min=self.angvel_range[0],
             max=self.angvel_range[1],
         ).reshape(self.num_envs, 1)
 
-        self.cmd_yawvel_b = torch.where(
-            self.use_stiffness,
-            cmd_yawvel_b,
-            self.fixed_yaw_speed
-        ).reshape(self.num_envs, 1)
+        # World frame velocity
+        self.cmd_linvel_w = quat_rotate(yaw_q, self.cmd_linvel_b)
 
-        self.cmd_linvel_w = quat_rotate(yaw_quat(self.quat_w), self.cmd_linvel_b)
+        # Cumulative error tracking (for termination checks)
+        linvel_diff = self.lin_vel_w[:, :2] - self.cmd_linvel_w[:, :2]
+        linvel_error = linvel_diff.norm(dim=-1, keepdim=True)
+        angvel_diff = self.cmd_yawvel_b - self.ang_vel_w[:, 2:3]
+        angvel_error = angvel_diff.abs()
+        self._cum_linvel_error.mul_(0.98).add_(linvel_error * self.env.step_dt)
+        self._cum_angvel_error.mul_(0.98).add_(angvel_error * self.env.step_dt)
+
+        # Distance tracking for curriculum
+        self.current_speed = self.lin_vel_w.norm(dim=-1, keepdim=True)
+        self.distance_commanded = self.distance_commanded + self.command_speed * self.env.step_dt
+        self.distance_traveled = self.distance_traveled + self.current_speed * self.env.step_dt
+
+        # Resample: on interval only (robot should learn to stop at target)
+        interval_reached = (self.env.episode_length_buf - 20) % self.resample_interval == 0
+        resample = interval_reached & (
+            self.with_prob(self.num_envs, self.resample_prob)
+            | self.is_standing_env.squeeze(1)
+        )
+        resample_ids = resample.nonzero().squeeze(-1)
+        self.sample_pos_command(resample_ids)
+        self.sample_yaw_command(resample_ids)
+
         self.is_standing_env = (self.command_speed < 0.1) & (self.cmd_yawvel_b.abs() < 0.1)
 
         # Update hand target tracking
@@ -333,23 +349,34 @@ class KpPosTrack(Command):
         if len(resample_ids) > 0:
             self.sample_hand_command(resample_ids)
 
-    def sample_vel_command(self, env_ids: torch.Tensor):
-        next_command_linvel = torch.zeros(len(env_ids), 3, device=self.device)
-        next_command_linvel[:, 0].uniform_(*self.linvel_x_range)
-        next_command_linvel[:, 1].uniform_(*self.linvel_y_range)
+    def sample_pos_command(self, env_ids: torch.Tensor):
+        """Sample target position in world frame by sampling offset in body frame."""
+        if len(env_ids) == 0:
+            return
+        n = len(env_ids)
+        root_pos_w = self.asset.data.root_link_pos_w[env_ids]
+        yaw_q = yaw_quat(self.asset.data.root_link_quat_w[env_ids])
 
-        speed = next_command_linvel.norm(dim=-1, keepdim=True)
-        r = torch.rand(len(env_ids), 1, device=self.device) < self.stand_prob
-        valid = ~((speed < 0.10) | r)
-        self.next_command_linvel[env_ids] = next_command_linvel * valid
-        self.cmd_base_height[env_ids] = sample_uniform((len(env_ids), 1), *self.base_height_range, self.device)
+        # Sample offset in body frame
+        offset_b = torch.zeros(n, 3, device=self.device)
+        offset_b[:, 0].uniform_(*self.pos_x_range)
+        offset_b[:, 1].uniform_(*self.pos_y_range)
+
+        # With stand_prob, set offset to zero (stay in place)
+        stand = torch.rand(n, device=self.device) < self.stand_prob
+        offset_b[stand] = 0.0
+
+        # Convert to world frame and set target
+        offset_w = quat_rotate(yaw_q, offset_b)
+        self.target_pos_w[env_ids] = root_pos_w[:, :2] + offset_w[:, :2]
 
     def sample_yaw_command(self, env_ids: torch.Tensor):
+        """Sample target heading and P-control gain."""
+        if len(env_ids) == 0:
+            return
         self.target_yaw[env_ids] = self.target_yaw_dist.sample(env_ids.shape).unsqueeze(1)
         shape = (len(env_ids), 1)
         self.yaw_stiffness[env_ids] = sample_uniform(shape, *self.yaw_stiffness_range, self.device)
-        self.use_stiffness[env_ids] = self.with_prob(shape, self.use_stiffness_ratio)
-        self.fixed_yaw_speed[env_ids] = sample_uniform(shape, *self.angvel_range, self.device)
 
     def _init_hand_targets(self, env_ids: torch.Tensor):
         """Set hand trajectory start=end=current positions so error starts at 0."""
@@ -410,6 +437,11 @@ class KpPosTrack(Command):
         """Hand position errors in body frame: (N, 6) — [left_x, left_y, left_z, right_x, right_y, right_z]."""
         return self.hand_pos_error_b.reshape(self.num_envs, 6)
 
+    @property
+    def command_target(self):
+        """Position error (body frame) + heading error: (N, 3)."""
+        return torch.cat([self.pos_error_b, self.heading_error], dim=-1)
+
     @override
     def debug_draw(self):
         start = self.asset.data.root_link_pos_w + torch.tensor([0.0, 0.0, 0.2], device=self.device)
@@ -450,6 +482,17 @@ class KpPosTrack(Command):
                 yaw_vec,
                 color=(0.2, 0.2, 1.0, 1.0),
             )
+            # Draw target position (cyan point)
+            target_pos_3d = torch.zeros(self.num_envs, 3, device=self.device)
+            target_pos_3d[:, :2] = self.target_pos_w
+            target_pos_3d[:, 2] = self.asset.data.root_link_pos_w[:, 2]
+            self.env.debug_draw.point(target_pos_3d, color=(0.0, 1.0, 1.0, 1.0))
+            # Line from robot to target position (cyan)
+            self.env.debug_draw.vector(
+                start,
+                target_pos_3d - start,
+                color=(0.0, 1.0, 1.0, 0.5),
+            )
             # Trajectory start points (yellow)
             self.env.debug_draw.point(
                 torch.cat([traj_start_left_w, traj_start_right_w], dim=0),
@@ -485,7 +528,7 @@ class KpPosTrack(Command):
     
     def symmetry_transform(self):
         # left-right symmetry: flip y velocity and yaw velocity
-        transform = symmetry_utils.SymmetryTransform(perm=torch.arange(4), signs=[1, -1, -1, 1])
+        transform = symmetry_utils.SymmetryTransform(perm=torch.arange(3), signs=[1, -1, -1])
         return transform
 
     def hand_target_symmetry_transform(self):
