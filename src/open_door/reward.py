@@ -140,7 +140,7 @@ class pos_tracking_exp(Reward):
         pos_error = self.command_manager.pos_error_b  # (N, 2)
         error_sq = pos_error.square().sum(dim=-1, keepdim=True)  # (N, 1)
         rew = torch.exp(-error_sq / self.sigma)
-        self.env.extra["pos_track/error_sq_dist"] = error_sq.detach().cpu().reshape(-1).numpy()
+        self.env.extra["pos_track/error_mean"] = error_sq.detach().mean().item()
         return rew
 
 
@@ -159,5 +159,5 @@ class heading_tracking_exp(Reward):
         heading_error = self.command_manager.heading_error  # (N, 1)
         error_sq = heading_error.square()
         rew = torch.exp(-error_sq / self.sigma)
-        self.env.extra["heading_track/error_sq_dist"] = error_sq.detach().cpu().reshape(-1).numpy()
+        self.env.extra["heading_track/error_mean"] = error_sq.detach().mean().item()
         return rew
