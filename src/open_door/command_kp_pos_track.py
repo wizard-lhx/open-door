@@ -19,7 +19,7 @@ from active_adaptation.utils.math import (
     sample_quat_yaw
 )
 import active_adaptation.utils.symmetry as symmetry_utils
-from active_adaptation.envs.mdp.base import Command
+from active_adaptation.envs.mdp.commands import Command
 
 def sample_uniform(size, low: float, high: float, device: torch.device = "cpu"):
     return torch.rand(size, device=device) * (high - low) + low

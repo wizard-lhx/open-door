@@ -2,7 +2,7 @@ import torch
 from typing_extensions import override
 
 import active_adaptation.utils.symmetry as symmetry_utils
-from active_adaptation.envs.mdp.base import Observation
+from active_adaptation.envs.mdp.observations import Observation
 
 
 class command_target(Observation):

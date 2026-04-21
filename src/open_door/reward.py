@@ -1,9 +1,8 @@
 import torch
-import wandb
 from typing import List, TYPE_CHECKING
 from typing_extensions import override
 
-from active_adaptation.envs.mdp.base import Reward
+from active_adaptation.envs.mdp.rewards import Reward
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
@@ -22,7 +21,7 @@ class hand_tracking_exp(Reward):
         self.sigma = sigma
 
     @override
-    def compute(self) -> torch.Tensor:
+    def _compute(self) -> torch.Tensor:
         # hand_pos_error_b: (N, 2, 3)
         error = self.command_manager.hand_pos_error_b
         error_sq = error.square().sum(dim=-1)   # (N, 2)
@@ -45,7 +44,7 @@ class hand_tracking_l2(Reward):
         super().__init__(env, weight)
 
     @override
-    def compute(self) -> torch.Tensor:
+    def _compute(self) -> torch.Tensor:
         error = self.command_manager.hand_pos_error_b
         error_sq = error.square().sum(dim=-1)  # (N, 2)
         return -error_sq.mean(dim=-1, keepdim=True)  # (N, 1)
@@ -69,7 +68,7 @@ class foot_clearance(Reward):
         self.tanh_mult = tanh_mult
 
     @override
-    def compute(self) -> torch.Tensor:
+    def _compute(self) -> torch.Tensor:
         foot_z = self.asset.data.body_link_pos_w[:, self.body_ids, 2]
         foot_z_target_error = (foot_z - self.target_height).square()
         foot_vel_xy = self.asset.data.body_lin_vel_w[:, self.body_ids, :2].norm(dim=-1)
@@ -103,7 +102,7 @@ class feet_gait(Reward):
         self.threshold = threshold
 
     @override
-    def compute(self) -> torch.Tensor:
+    def _compute(self) -> torch.Tensor:
         contact_time = self.contact_sensor.data.current_contact_time[:, self.contact_body_ids]
         air_time = self.contact_sensor.data.current_air_time[:, self.contact_body_ids]
         in_contact = contact_time > 0.0
@@ -136,7 +135,7 @@ class pos_tracking_exp(Reward):
         self.sigma = sigma
 
     @override
-    def compute(self) -> torch.Tensor:
+    def _compute(self) -> torch.Tensor:
         pos_error = self.command_manager.pos_error_b  # (N, 2)
         error_sq = pos_error.square().sum(dim=-1, keepdim=True)  # (N, 1)
         rew = torch.exp(-error_sq / self.sigma)
@@ -155,9 +154,41 @@ class heading_tracking_exp(Reward):
         self.sigma = sigma
 
     @override
-    def compute(self) -> torch.Tensor:
+    def _compute(self) -> torch.Tensor:
         heading_error = self.command_manager.heading_error  # (N, 1)
         error_sq = heading_error.square()
         rew = torch.exp(-error_sq / self.sigma)
         self.env.extra["heading_track/error_mean"] = error_sq.detach().mean().item()
+        return rew
+
+
+class tracking_base_height(Reward):
+    """Exponential reward for tracking the base height above the ground."""
+
+    def __init__(
+        self,
+        env,
+        weight: float,
+        target_height: float | None = None,
+        sigma: float = 0.2,
+    ):
+        super().__init__(env, weight)
+        self.asset: Articulation = self.env.scene["robot"]
+        self.target_height = target_height
+        self.sigma = sigma
+
+    @override
+    def _compute(self) -> torch.Tensor:
+        root_link_pos_w = self.asset.data.root_link_pos_w
+        ground_height = self.env.get_ground_height_at(root_link_pos_w).reshape(self.num_envs, 1)
+        base_height = root_link_pos_w[:, 2:3] - ground_height
+
+        if self.target_height is None:
+            target_height = self.command_manager.cmd_base_height.reshape(self.num_envs, 1)
+        else:
+            target_height = torch.full_like(base_height, self.target_height)
+
+        error_sq = (base_height - target_height).square()
+        rew = torch.exp(-error_sq / self.sigma)
+        self.env.extra["base_height/error_mean"] = error_sq.detach().mean().item()
         return rew
